@@ -210,8 +210,13 @@ func (a *App) retryWatchers() {
 func (a *App) onScreenshot(filename string) {
 	a.logEvent("Screenshot: " + filename)
 	go func() {
+		started := time.Now()
 		if err := a.client.SendScreenshot(filename); err != nil {
 			a.logEvent("Send error: " + err.Error())
+		} else if took := time.Since(started); took > time.Second {
+			// a retried send used to be invisible in the log — the position
+			// just showed up late on the website
+			a.logEvent("Screenshot send was slow: " + took.Round(time.Millisecond).String())
 		}
 		a.emitState()
 	}()

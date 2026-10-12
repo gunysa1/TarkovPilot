@@ -4,6 +4,7 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -16,6 +17,19 @@ import (
 
 // ErrBadKey — the server replied that hookId was not found (connection key is invalid)
 var ErrBadKey = errors.New("bad key")
+
+const (
+	// per-attempt timeout for latency-critical events (screenshot, map): the
+	// player is watching the map and waiting for the marker, so a stalled
+	// connection must be abandoned and retried instead of waited out
+	fastTimeout = 2500 * time.Millisecond
+	// status heartbeat and quest sync: bigger payloads, nobody is waiting
+	slowTimeout = 10 * time.Second
+
+	// attempts per event and the pause between them
+	maxAttempts = 3
+	retryDelay  = 250 * time.Millisecond
+)
 
 type Client struct {
 	// getters instead of copies: hookId and host are edited in the UI on the fly
@@ -116,8 +130,18 @@ func (c *Client) url() string {
 	return fmt.Sprintf("https://%s/api/be/pilot/script/webhook", c.Host())
 }
 
-// post sends a webhook; 2 attempts — events are few and the network can blink
+// post sends a webhook with the default timeout
 func (c *Client) post(payload map[string]any) ([]byte, error) {
+	return c.postWithin(slowTimeout, payload)
+}
+
+// postWithin sends a webhook; up to maxAttempts attempts — events are few and
+// the network can blink. timeout caps each attempt on its own, so a single
+// stalled connection costs one timeout instead of the whole budget: the path
+// to the website can hang for tens of seconds (see "wsarecv" / "Client.Timeout
+// exceeded while awaiting headers" in events.log), and a retry gets a fresh
+// connection
+func (c *Client) postWithin(timeout time.Duration, payload map[string]any) ([]byte, error) {
 	payload["hookId"] = c.HookId()
 
 	body, err := json.Marshal(payload)
@@ -126,27 +150,23 @@ func (c *Client) post(payload map[string]any) ([]byte, error) {
 	}
 
 	var lastErr error
-	for attempt := 0; attempt < 2; attempt++ {
+	for attempt := 0; attempt < maxAttempts; attempt++ {
 		if attempt > 0 {
-			time.Sleep(2 * time.Second)
+			time.Sleep(retryDelay)
 		}
 
-		resp, err := c.http.Post(c.url(), "application/json", bytes.NewReader(body))
+		buf, status, err := c.postOnce(timeout, body)
 		if err != nil {
 			lastErr = err
 			continue
 		}
 
-		buf := new(bytes.Buffer)
-		_, _ = buf.ReadFrom(resp.Body)
-		resp.Body.Close()
-
-		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		if status >= 200 && status < 300 {
 			c.serverOK.Store(true)
 			c.checked.Store(true)
-			return buf.Bytes(), nil
+			return buf, nil
 		}
-		lastErr = fmt.Errorf("http %d", resp.StatusCode)
+		lastErr = fmt.Errorf("http %d", status)
 	}
 
 	c.serverOK.Store(false)
@@ -154,15 +174,40 @@ func (c *Client) post(payload map[string]any) ([]byte, error) {
 	return nil, lastErr
 }
 
-// SendScreenshot — player position: the website parses coordinates from the file name
+// postOnce — a single attempt, abandoned after timeout
+func (c *Client) postOnce(timeout time.Duration, body []byte) ([]byte, int, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.url(), bytes.NewReader(body))
+	if err != nil {
+		return nil, 0, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer resp.Body.Close()
+
+	buf, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, 0, err
+	}
+	return buf, resp.StatusCode, nil
+}
+
+// SendScreenshot — player position: the website parses coordinates from the file name.
+// Latency-critical: sent with the short timeout
 func (c *Client) SendScreenshot(filename string) error {
-	_, err := c.post(map[string]any{"event": "screenshot", "filename": filename})
+	_, err := c.postWithin(fastTimeout, map[string]any{"event": "screenshot", "filename": filename})
 	return err
 }
 
 // SendMap — location change (raw name from the log, e.g. 'bigmap')
 func (c *Client) SendMap(mapName string) error {
-	_, err := c.post(map[string]any{"event": "map", "map": mapName})
+	_, err := c.postWithin(fastTimeout, map[string]any{"event": "map", "map": mapName})
 	return err
 }
 
